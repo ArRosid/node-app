@@ -1,74 +1,118 @@
-name: Belajar CI/CD Python
-
 on:
   push:
     branches:
-      - dev1
+      - dev3    
+
+env:
+  AWS_REGION: us-east-1
+  ENV: "main"
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  install:
+  build:
+    name: Build image production
     runs-on: ubuntu-latest
-
+    environment: Production
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+    - name: Checkout
+      uses: actions/checkout@v3
+   
+    - name: Configure aws credentials
+      uses: aws-action/configure-aws-credentials@v1
+      with: 
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }} 
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: ${{ env.AWS_REGION }}
 
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v2
-        with:
-          python-version: 3.13
+    - name: Login ecr
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirement.txt
+    - name: Build ecr prod
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: lks-docker-image
+        NODEJS_IMAGE_TAG: nodejs-${{ env.ENV }}-latest
+      run: |
+        sudo apt update
+        sudo apt install docker-ce -y
+        docker --version
 
-  build-and-push:
-    needs: install
-    runs-on: ubuntu-latest
+        # put command to build the image.. image name is $ECR_REGISTRY/$ECR_REPOSITORY:$NODEJS_IMAGE_TAG
+        #.....
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+        # put command to push image to ecr
+        #....
+        
+        echo "::set-output name=nodejs_image::$ECR_REGISTRY/$ECR_REPOSITORY:$NODEJS_IMAGE_TAG"
 
-      - name: Zip application for deployment
-        run: zip -r application.zip . -x '*.git*'
+    - name: Create Dockerrun.aws.json
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: lks-docker-image
+        NODEJS_IMAGE_TAG: nodejs-${{ env.ENV }}-latest   
+      run: |
+        cat <<EOF > Dockerrun.aws.json
+        {
+            "AWSEBDockerrunVersion": "1",
+            "Image": {
+                "Name": "$ECR_REGISTRY/$ECR_REPOSITORY:$NODEJS_IMAGE_TAG",
+                "Update": "true"
+            },
+            "Ports": [
+                {
+                    "ContainerPort": 8000,
+                    "HostPort": 80
+                }
+            ]
+        }
+        EOF
+            
+    - name: Build zip
+      run: zip nodejsdocker.zip Dockerrun.aws.json
 
-      - name: Upload to S3
-        run: |
-          # put the code to upload zip file to s3 here
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
-          S3_KEY: "deployments/application-${{ github.sha }}.zip"
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: nodejsdocker
+        path: nodejsdocker.zip
+
+    - name: Upload to S3
+      run: |
+        aws s3 cp nodejsdocker.zip s3://${{ secrets.S3_BUCKET_NAME }}/nodejsdocker.zip
+
+    - name: End Build
+      run: echo "Build Success"
 
   deploy:
-    needs: build-and-push
+    needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy to Elastic Beanstalk
-        run: |
-          aws elasticbeanstalk create-application-version \
-            --application-name ${{ secrets.EB_APP_NAME }} \
-            --version-label $GITHUB_SHA \
-            --source-bundle S3Bucket=$S3_BUCKET_NAME,S3Key=$S3_KEY \
-            --region $AWS_REGION
+    - name: Download build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: nodejsdocker
 
-          aws elasticbeanstalk update-environment \
-            --environment-name ${{ secrets.EB_ENV_NAME }} \
-            --version-label $GITHUB_SHA
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          
-          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
-          S3_KEY: "deployments/application-${{ github.sha }}.zip"
-
-          EB_ENV_NAME: ${{ secrets.EB_ENV_NAME }}
-          EB_APP_NAME: ${{ secrets.EB_APP_NAME }}
+    - name: Deploy to elastic beanstalk
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+        EB_APP_NAME: ${{ secrets.EB_APP_NAME }}
+        EB_ENV_NAME: ${{ secrets.EB_ENV_NAME }}
+        ZIP_FILE: "nodejsdocker.zip"
+      run: |
+        VERSION_LABEL="${{ github.sha }}-$(date +%s)"
+        aws elasticbeanstalk create-application-version \
+          --application-name ${{ secrets.EB_APP_NAME }} \
+          --version-label $VERSION_LABEL \
+          --source-bundle S3Bucket=${{ secrets.S3_BUCKET_NAME }},S3Key=nodejsdocker.zip
+        aws elasticbeanstalk update-environment \
+          --environment-name ${{ secrets.EB_ENV_NAME }} \
+          --version-label $VERSION_LABEL        
